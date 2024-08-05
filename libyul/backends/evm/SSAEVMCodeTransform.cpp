@@ -412,17 +412,12 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 	for (auto&& [op, liveOut]: ranges::zip_view(m_cfg.block(_block).operations, liveness(_block).operationLiveOuts))
 		(*this)(op, liveOut);
 
-	auto cleanUpStack = [&](std::optional<SSACFG::ValueId> _additional = std::nullopt) {
-		auto liveOut = liveness(_block).liveOut;
-		if (_additional)
-			liveOut.emplace(*_additional);
+	auto restrictStackToSet = [&](std::set<SSACFG::ValueId> liveOut) {
 		auto originalLiveOut = liveOut;
 		std::vector<size_t> freeSlots;
 		for (auto&& [pos, slot]: m_stack | ranges::view::enumerate)
 		{
 			if (std::holds_alternative<AbstractAssembly::LabelID>(slot))
-				freeSlots.emplace_back(pos);
-			if (std::holds_alternative<JunkSlot>(slot))
 				freeSlots.emplace_back(pos);
 			if (!liveOut.erase(std::get<SSACFG::ValueId>(slot)))
 				freeSlots.emplace_back(pos);
@@ -457,7 +452,13 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 		yulAssert(originalLiveOut.size() == m_stack.size());
 		yulAssert((m_stack | ranges::to<std::set<StackSlot>>) == (originalLiveOut | ranges::to<std::set<StackSlot>>));
 	};
-
+	auto cleanUpStack = [&](std::optional<SSACFG::ValueId> _additional = std::nullopt)
+	{
+		auto liveOut = liveness(_block).liveOut;
+		if (_additional)
+			liveOut.emplace(*_additional);
+		restrictStackToSet(liveOut);
+	};
 	auto transformStackWithTargetPhis = [&](SSACFG::BlockId _current, SSACFG::BlockId _target, std::vector<StackSlot> const& _stack, bool _direction) {
 		auto const& targetInfo = m_cfg.block(_target);
 		size_t phiArgumentIndex = [&]() {
@@ -501,6 +502,24 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 		}
 		return result;
 	};
+	auto inSetOfBlock = [&](SSACFG::BlockId _target) {
+		std::set<SSACFG::ValueId> result = liveness(_target).liveIn;
+		auto const& targetInfo = m_cfg.block(_target);
+		size_t phiArgumentIndex = [&]() {
+			auto idx = util::findOffset(targetInfo.entries, _block);
+			yulAssert(idx, "Current block not found as entry in one of the exits of the current block.");
+			return *idx;
+		}();
+		for (auto phi: m_cfg.block(_target).phis)
+		{
+			auto const* phiInfo = std::get_if<SSACFG::PhiValue>(&m_cfg.valueInfo(phi));
+			yulAssert(phiInfo);
+			auto slot = phiInfo->arguments.at(phiArgumentIndex);
+			if (!std::holds_alternative<SSACFG::LiteralValue>(m_cfg.valueInfo(slot)))
+				result.emplace(slot);
+		}
+		return result;
+	};
 	auto targetStackToCurrentStack = [&](SSACFG::BlockId _target) {
 		yulAssert(blockData(_target).stackIn);
 		auto const& targetInfo = m_cfg.block(_target);
@@ -526,9 +545,11 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 						break;
 					}
 				}
-				// TODO: figure out if and why this can even happen
+				// TODO: simplify; get rid of skip
 				if (skip)
-					slot = JunkSlot{};
+				{
+					std::cout << "Weird slot: " << stackSlotToString(slot) << std::endl;
+				}
 			}
 		}
 		return stack;
@@ -582,8 +603,14 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 				createExactStack(targetStackToCurrentStack(_conditionalJump.zero));
 			else
 			{
-				cleanUpStack();
+				std::cout << "STACK1: " << stackToString(m_stack) << std::endl;
+				auto inset = inSetOfBlock(_conditionalJump.zero);
+				std::cout << "INSET: " << stackToString(inset | ranges::to<std::vector<StackSlot>>) << std::endl;
+				restrictStackToSet(inset);
+				std::cout << "STACK2: " << stackToString(m_stack) << std::endl;
 				zeroLayout = currentStackToTargetStack(_conditionalJump.zero);
+				std::cout << "STACK3: " << stackToString(*zeroLayout) << std::endl;
+				std::cout << "(to b" << _conditionalJump.zero.value << ")" << std::endl;
 			}
 			m_assembly.appendJumpTo(*zeroLabel);
 			(*this)(_conditionalJump.zero);
@@ -684,9 +711,9 @@ void SSAEVMCodeTransform::createStackTop(
 {
 
 
-/*	std::cout << "Create Stack Top " << stackToString(_targetTop) << " from " << stackToString(m_stack) << " (live out: " << stackToString(_liveOut|ranges::to<std::vector<StackSlot>>) << ")" << " (Current block: " << m_currentBlock.value << ")" << std::endl;
+	std::cout << "Create Stack Top " << stackToString(_targetTop) << " from " << stackToString(m_stack) << " (live out: " << stackToString(_liveOut|ranges::to<std::vector<StackSlot>>) << ")" << " (Current block: " << m_currentBlock.value << ")" << std::endl;
 	createExactStack((_liveOut | ranges::to<std::vector<StackSlot>>) + _targetTop);
-	return;*/
+	return;
 
 	// Hack to keep stacks manageably small despite being otherwise wastefull.
 	auto cleanUpStack = [&]() {
@@ -701,8 +728,6 @@ void SSAEVMCodeTransform::createStackTop(
 		for (auto&& [pos, slot]: m_stack | ranges::view::enumerate)
 		{
 			if (std::holds_alternative<AbstractAssembly::LabelID>(slot))
-				freeSlots.emplace_back(pos);
-			if (std::holds_alternative<JunkSlot>(slot))
 				freeSlots.emplace_back(pos);
 			if (!liveOut.erase(std::get<SSACFG::ValueId>(slot)))
 				freeSlots.emplace_back(pos);
@@ -758,12 +783,6 @@ void SSAEVMCodeTransform::createStackTop(
 			[&](AbstractAssembly::LabelID _label) {
 				m_assembly.appendLabelReference(_label);
 				m_stack.emplace_back(_label);
-			},
-			[&](JunkSlot) {
-				// TODO: potentially use cheaper opcode pre-PUSH0
-				m_assembly.appendConstant(0);
-				m_stack.emplace_back(JunkSlot{});
-				yulAssert(false, "Why junk");
 			}
 		}, slot);
 }
@@ -791,11 +810,6 @@ void SSAEVMCodeTransform::bringUpSlot(StackSlot const& _slot)
 		[&](AbstractAssembly::LabelID _label) {
 			m_assembly.appendLabelReference(_label);
 			m_stack.emplace_back(_label);
-		},
-		[&](JunkSlot) {
-			// TODO: potentially use cheaper opcode pre-PUSH0
-			m_assembly.appendConstant(0);
-			m_stack.emplace_back(JunkSlot{});
 		}
 	}, _slot);
 }
@@ -839,7 +853,7 @@ void SSAEVMCodeTransform::createExactStack(std::vector<StackSlot> const& _target
 	do
 	{
 		// As long as stack top isn't final
-		while(m_stack.size() > _target.size() || (!m_stack.empty() && !std::holds_alternative<JunkSlot>(_target[m_stack.size() - 1]) && _target[m_stack.size() - 1] != m_stack.back()))
+		while(m_stack.size() > _target.size() || (!m_stack.empty() && _target[m_stack.size() - 1] != m_stack.back()))
 		{
 			std::cout << "  ..." << stackToString(m_stack) << std::endl;
 
@@ -853,7 +867,7 @@ void SSAEVMCodeTransform::createExactStack(std::vector<StackSlot> const& _target
 		for (auto [pos, slots]: ranges::zip_view(m_stack, _target) | ranges::view::enumerate)
 		{
 			auto [stack, target] = slots;
-			if (!std::holds_alternative<JunkSlot>(target) && stack != target)
+			if (stack != target)
 			{
 				bringUpSlot(target);
 				return true;
@@ -865,9 +879,7 @@ void SSAEVMCodeTransform::createExactStack(std::vector<StackSlot> const& _target
 		bringUpSlot(_target[m_stack.size()]);
 
 	yulAssert(m_stack.size() == _target.size());
-	// If junk is removed again, simpler: yulAssert(m_stack == _target);
-	for (auto [slot, targetSlot]: ranges::zip_view(m_stack, _target))
-		yulAssert(std::holds_alternative<JunkSlot>(targetSlot) || slot == targetSlot);
+	yulAssert(m_stack == _target);
 }
 
 std::string SSAEVMCodeTransform::stackToString(std::vector<StackSlot> const& _stack)
@@ -883,9 +895,6 @@ std::string SSAEVMCodeTransform::stackSlotToString(StackSlot const& _slot)
 		},
 		[](AbstractAssembly::LabelID _label) {
 			return "LABEL[" + std::to_string(_label) + "]";
-		},
-		[](JunkSlot) -> std::string {
-			return "JUNK";
 		}
 	}, _slot);
 }

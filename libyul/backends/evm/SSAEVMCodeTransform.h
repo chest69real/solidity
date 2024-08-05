@@ -116,13 +116,7 @@ private:
 		return m_livenessData[_block];
 	}
 
-	struct JunkSlot {
-		bool operator==(JunkSlot const&) const { return true; }
-		bool operator!=(JunkSlot const&) const { return false; }
-		bool operator<(JunkSlot const&) const { return false; }
-	};
-
-	using StackSlot = std::variant<SSACFG::ValueId, AbstractAssembly::LabelID, JunkSlot>;
+	using StackSlot = std::variant<SSACFG::ValueId, AbstractAssembly::LabelID>;
 	struct BlockData {
 		bool generated = false;
 		std::optional<AbstractAssembly::LabelID> label;
