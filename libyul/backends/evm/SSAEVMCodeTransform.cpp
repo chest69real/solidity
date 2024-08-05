@@ -92,7 +92,8 @@ void debugPrintCFG(SSACFG const& _ssacfg, LivenessData const& _liveness) {
 								std::cout << "    b" << entry.value << " => " << varToString(input) << std::endl;
 							std::cout << "  )" << std::endl;
 						}
-						for (auto const& op: block.operations)
+						yulAssert(block.operations.size() == _liveness[_blockId].operationLiveOuts.size());
+						for (auto&& [op, liveOut]: ranges::zip_view(block.operations, _liveness[_blockId].operationLiveOuts))
 						{
 							std::cout << "  ";
 							if (!op.outputs.empty())
@@ -113,15 +114,17 @@ void debugPrintCFG(SSACFG const& _ssacfg, LivenessData const& _liveness) {
 											   std::cout << _call.function.get().name.str();
 											   std::cout << "(";
 											   std::cout << util::joinHumanReadable(op.inputs | ranges::view::reverse | ranges::view::transform(varToString));
-											   std::cout << ")" << std::endl;
+											   std::cout << ")";
 										   },
 										   [&](SSACFG::BuiltinCall const& _call) {
 											   std::cout << _call.builtin.get().name.str();
 											   std::cout << "(";
 											   std::cout << util::joinHumanReadable(op.inputs | ranges::view::reverse | ranges::view::transform(varToString));
-											   std::cout << ")" << std::endl;
+											   std::cout << ")";
 										   }
 									   }, op.kind);
+							std::cout << "    [LIVEOUT: " << util::joinHumanReadable(liveOut | ranges::view::transform(varToString)) << "]";
+							std::cout << std::endl;
 						}
 						std::visit(util::GenericVisitor{
 									   [&](SSACFG::BasicBlock::MainExit const&)
@@ -397,12 +400,15 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 
 	{
 		auto& stackIn = blockData(_block).stackIn;
-		if (!stackIn)
-			stackIn = liveness(_block).liveIn | ranges::to<std::vector<StackSlot>>;
+		yulAssert(stackIn, "No starting layout for block b" + std::to_string(_block.value));
+		// if (!stackIn)
+		//	stackIn = liveness(_block).liveIn | ranges::to<std::vector<StackSlot>>;
 		m_stack = *stackIn | ranges::to<std::vector<StackSlot>>;
 	}
 	m_assembly.setStackHeight(static_cast<int>(m_stack.size()));
+	std::cout << "Generate block b" << _block.value << ": " << stackToString(m_stack) << std::endl;
 
+	yulAssert(m_cfg.block(_block).operations.size() == liveness(_block).operationLiveOuts.size());
 	for (auto&& [op, liveOut]: ranges::zip_view(m_cfg.block(_block).operations, liveness(_block).operationLiveOuts))
 		(*this)(op, liveOut);
 
@@ -475,7 +481,25 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 		}) | ranges::to<std::vector>;
 	};
 	auto currentStackToTargetStack = [&](SSACFG::BlockId _target) {
-		return transformStackWithTargetPhis(_block, _target, m_stack, true);
+		auto result = transformStackWithTargetPhis(_block, _target, m_stack, true);
+		// TODO: this is a hack... this should happen elsewhere somehow...
+		auto const& targetInfo = m_cfg.block(_target);
+		size_t phiArgumentIndex = [&]() {
+			auto idx = util::findOffset(targetInfo.entries, _block);
+			yulAssert(idx, "Current block not found as entry in one of the exits of the current block.");
+			return *idx;
+		}();
+		for (auto const& phi: m_cfg.block(_target).phis)
+		{
+			auto const* phiInfo = std::get_if<SSACFG::PhiValue>(&m_cfg.valueInfo(phi));
+			yulAssert(phiInfo);
+			if (!util::contains(m_stack, StackSlot{phi}))
+			{
+				bringUpSlot(phiInfo->arguments.at(phiArgumentIndex));
+				result.emplace_back(phi);
+			}
+		}
+		return result;
 	};
 	auto targetStackToCurrentStack = [&](SSACFG::BlockId _target) {
 		yulAssert(blockData(_target).stackIn);
@@ -508,16 +532,6 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 			}
 		}
 		return stack;
-	};
-	struct SaveRestoreStackHeight
-	{
-		SaveRestoreStackHeight(AbstractAssembly& _assembly): m_assembly(_assembly) {}
-		SaveRestoreStackHeight(SaveRestoreStackHeight const&) = delete;
-		SaveRestoreStackHeight& operator=(SaveRestoreStackHeight const&) = delete;
-		~SaveRestoreStackHeight() { m_assembly.setStackHeight(m_height); }
-		AbstractAssembly& m_assembly;
-	private:
-		int m_height = m_assembly.stackHeight();
 	};
 
 	std::visit(util::GenericVisitor{
@@ -572,14 +586,8 @@ void SSAEVMCodeTransform::operator()(SSACFG::BlockId _block)
 				zeroLayout = currentStackToTargetStack(_conditionalJump.zero);
 			}
 			m_assembly.appendJumpTo(*zeroLabel);
-			{
-				SaveRestoreStackHeight saveRestoreStackHeight{m_assembly};
-				(*this)(_conditionalJump.zero);
-			}
-			{
-				SaveRestoreStackHeight saveRestoreStackHeight{m_assembly};
-				(*this)(_conditionalJump.nonZero);
-			}
+			(*this)(_conditionalJump.zero);
+			(*this)(_conditionalJump.nonZero);
 		},
 		[&](SSACFG::BasicBlock::JumpTable const&){ yulAssert(false, "Jump tables not yet implemented."); },
 		[&](SSACFG::BasicBlock::FunctionReturn const& _return){
@@ -629,6 +637,8 @@ void SSAEVMCodeTransform::operator()(SSACFG::Operation const& _operation, std::s
 		else
 			++it;
 	}
+	for (auto output: _operation.outputs)
+		liveOut.erase(output);
 
 	createStackTop(requiredStackTop, liveOut);
 	std::visit(util::GenericVisitor {
@@ -672,7 +682,11 @@ void SSAEVMCodeTransform::createStackTop(
 	std::set<SSACFG::ValueId> const& _liveOut
 )
 {
-	std::cout << "Create Stack Top " << stackToString(_targetTop) << " from " << stackToString(m_stack) << " (live out: " << stackToString(_liveOut|ranges::to<std::vector<StackSlot>>) << ")" << " (Current block: " << m_currentBlock.value << ")" << std::endl;
+
+
+/*	std::cout << "Create Stack Top " << stackToString(_targetTop) << " from " << stackToString(m_stack) << " (live out: " << stackToString(_liveOut|ranges::to<std::vector<StackSlot>>) << ")" << " (Current block: " << m_currentBlock.value << ")" << std::endl;
+	createExactStack((_liveOut | ranges::to<std::vector<StackSlot>>) + _targetTop);
+	return;*/
 
 	// Hack to keep stacks manageably small despite being otherwise wastefull.
 	auto cleanUpStack = [&]() {
@@ -749,6 +763,7 @@ void SSAEVMCodeTransform::createStackTop(
 				// TODO: potentially use cheaper opcode pre-PUSH0
 				m_assembly.appendConstant(0);
 				m_stack.emplace_back(JunkSlot{});
+				yulAssert(false, "Why junk");
 			}
 		}, slot);
 }
@@ -804,11 +819,22 @@ void SSAEVMCodeTransform::createExactStack(std::vector<StackSlot> const& _target
 				yulAssert(m_stack[targetPos] == top);
 				return;
 			}
-		// If not, pop it.
-		pop();
+		if (!targetPositions[top].empty() && *targetPositions[top].begin() >= m_stack.size())
+		{
+			bringUpSlot(_target.at(m_stack.size()));
+		}
+		else
+		{
+			// If not, pop it.
+			pop();
+		}
 	};
 
 	std::cout << "Create exact stack " + stackToString(_target) << " from " << stackToString(m_stack) << " (Current block: " << m_currentBlock.value << ")" << std::endl;
+	std::cout << "Target positions: {" << std::endl;
+	for (auto&& [key, values]: targetPositions)
+		std::cout << "  " << stackSlotToString(key) << " => " << util::joinHumanReadable(values | ranges::view::transform([](auto x) { return std::to_string(x); })	) << std::endl;
+	std::cout << "}" << std::endl;
 
 	do
 	{
@@ -823,6 +849,7 @@ void SSAEVMCodeTransform::createExactStack(std::vector<StackSlot> const& _target
 
 		// Stack top is final. If everything else is good, terminate - otherwise bring up one of the slots that are still needed in the target and continue.
 	} while ([&](){
+		 std::cout << "  ...(2)..." << stackToString(m_stack) << std::endl;
 		for (auto [pos, slots]: ranges::zip_view(m_stack, _target) | ranges::view::enumerate)
 		{
 			auto [stack, target] = slots;

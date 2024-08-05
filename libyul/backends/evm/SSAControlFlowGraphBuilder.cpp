@@ -40,6 +40,65 @@
 using namespace solidity;
 using namespace solidity::yul;
 
+namespace
+{
+/// Removes edges to blocks that are not reachable.
+void cleanUnreachable(SSACFG& _cfg)
+{
+	// Determine which blocks are reachable from the entry.
+	util::BreadthFirstSearch<SSACFG::BlockId> reachabilityCheck{{SSACFG::BlockId{0}}};
+	for (auto const& functionInfo: _cfg.functionInfos | ranges::views::values)
+		reachabilityCheck.verticesToTraverse.emplace_back(functionInfo.entry);
+
+	reachabilityCheck.run([&](SSACFG::BlockId _blockId, auto&& _addChild) {
+							  auto const& block = _cfg.block(_blockId);
+							  visit(util::GenericVisitor{
+										[&](SSACFG::BasicBlock::Jump const& _jump) {
+											_addChild(_jump.target);
+										},
+										[&](SSACFG::BasicBlock::ConditionalJump const& _jump) {
+											_addChild(_jump.zero);
+											_addChild(_jump.nonZero);
+										},
+										[](SSACFG::BasicBlock::JumpTable const&) { yulAssert(false); },
+										[](SSACFG::BasicBlock::FunctionReturn const&) {},
+										[](SSACFG::BasicBlock::Terminated const&) {},
+										[](SSACFG::BasicBlock::MainExit const&) {}
+									}, block.exit);
+						  });
+
+	auto isUnreachableValue = [&](SSACFG::ValueId const& _value) -> bool {
+		auto* valueInfo = std::get_if<SSACFG::UnreachableValue>(&_cfg.valueInfo(_value));
+		return (valueInfo) ? true : false;
+	};
+
+
+	// Remove all entries from unreachable nodes from the graph.
+	for (SSACFG::BlockId blockId: reachabilityCheck.visited)
+	{
+		auto& block = _cfg.block(blockId);
+
+		for (auto phi: block.phis)
+		{
+			auto& phiValue = std::get<SSACFG::PhiValue>(_cfg.valueInfo(phi));
+			yulAssert(block.entries.size() == phiValue.arguments.size());
+			for (auto&& [entry, arg]: ranges::zip_view(block.entries, phiValue.arguments))
+				yulAssert((reachabilityCheck.visited.count(entry) == 0) == isUnreachableValue(arg));
+		}
+
+		for (auto it = block.entries.begin(); it != block.entries.end();)
+			if (reachabilityCheck.visited.count(*it))
+				it++;
+			else
+				it = block.entries.erase(it);
+		for (auto phi: block.phis)
+			if (auto* phiInfo = std::get_if<SSACFG::PhiValue>(&_cfg.valueInfo(phi)))
+				cxx20::erase_if(phiInfo->arguments, isUnreachableValue);
+	}
+}
+
+}
+
 namespace solidity::yul
 {
 
@@ -75,6 +134,7 @@ std::unique_ptr<SSACFG> SSAControlFlowGraphBuilder::build(
 		builder.sealBlock(builder.m_currentBlock);
 	result->block(builder.m_currentBlock).exit = SSACFG::BasicBlock::MainExit{};
 
+	cleanUnreachable(*result);
 	return result;
 }
 
