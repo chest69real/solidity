@@ -75,6 +75,7 @@ public:
 		langutil::DebugData::ConstPtr debugData;
 		std::reference_wrapper<Scope::Function const> function;
 		std::reference_wrapper<FunctionCall const> call;
+		bool const canContinue = true;
 	};
 
 	struct Operation {
@@ -200,7 +201,7 @@ public:
 		return it->second;
 	}
 private:
-	std::vector<ValueInfo> m_valueInfos;
+	std::deque<ValueInfo> m_valueInfos;
 	std::map<u256, ValueId> m_literals;
 	std::optional<ValueId> m_unreachableValue;
 public:
@@ -209,6 +210,7 @@ public:
 
 	struct FunctionInfo {
 		langutil::DebugData::ConstPtr debugData;
+		std::reference_wrapper<Scope::Function const> function;
 		BlockId entry;
 		std::set<BlockId> exits;
 		bool canContinue = true;
@@ -218,6 +220,8 @@ public:
 	std::vector<std::reference_wrapper<Scope::Function const>> functions;
 	std::map<Scope::Function const*, FunctionInfo> functionInfos;
 
+	// Container for artificial calls generated for switch statements.
+	std::list<yul::FunctionCall> ghostCalls;
 };
 
 }

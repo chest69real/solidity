@@ -39,10 +39,10 @@ class ErrorReporter;
 namespace solidity::yul
 {
 struct AsmAnalysisInfo;
-struct StackLayout;
 
 struct BlockLivenessData {
 	std::set<SSACFG::ValueId> liveIn;
+	std::list<std::set<SSACFG::ValueId>> operationLiveOuts;
 	std::set<SSACFG::ValueId> liveOut;
 };
 
@@ -108,6 +108,7 @@ private:
 	AbstractAssembly::LabelID getFunctionLabel(Scope::Function const& _function);
 
 	void operator()(SSACFG::BlockId _block);
+	void operator()(SSACFG::Operation const& _operation, std::set<SSACFG::ValueId> const& _liveOut);
 
 	void operator()(SSACFG::FunctionInfo const& _functionInfo);
 
@@ -115,14 +116,29 @@ private:
 		return m_livenessData[_block];
 	}
 
+	struct JunkSlot {
+		bool operator==(JunkSlot const&) const { return true; }
+		bool operator!=(JunkSlot const&) const { return false; }
+		bool operator<(JunkSlot const&) const { return false; }
+	};
+
+	using StackSlot = std::variant<SSACFG::ValueId, AbstractAssembly::LabelID, JunkSlot>;
 	struct BlockData {
 		bool generated = false;
 		std::optional<AbstractAssembly::LabelID> label;
-		std::vector<SSACFG::ValueId> stackIn;
-		std::vector<SSACFG::ValueId> stackOut;
+		std::optional<std::vector<StackSlot>> stackIn;
+		//std::optional<std::vector<StackSlot>> stackOut;
 	};
 	BlockData& blockData(SSACFG::BlockId _block) { return m_blockData[_block]; }
 	BlockData const& blockData(SSACFG::BlockId _block) const { return m_blockData[_block]; }
+
+	void createStackTop(std::vector<StackSlot> const& _targetTop, std::set<SSACFG::ValueId> const& _liveOut);
+	void createExactStack(std::vector<StackSlot> const& _target);
+
+	void pop();
+	void swap(size_t _depth);
+	// Produces a copy of _slot at the current stack top (leaving the rest of the current stack untouched).
+	void bringUpSlot(StackSlot const& _slot);
 
 	AbstractAssembly& m_assembly;
 	BuiltinContext& m_builtinContext;
@@ -130,8 +146,14 @@ private:
 	LivenessData const& m_livenessData;
 	std::vector<StackTooDeepError> m_stackErrors;
 	std::map<SSACFG::FunctionInfo const*, AbstractAssembly::LabelID> const m_functionLabels;
-	std::vector<SSACFG::ValueId> m_stack;
+	std::vector<StackSlot> m_stack;
 	IdContainer<BlockData, SSACFG::BlockId> m_blockData;
+
+	std::string stackToString(std::vector<StackSlot> const& _stack);
+	std::string stackSlotToString(StackSlot const& _slot);
+
+	// TODO: remove - only for debugging purposes.
+	SSACFG::BlockId m_currentBlock;
 };
 
 }

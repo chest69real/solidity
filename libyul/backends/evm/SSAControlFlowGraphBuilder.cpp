@@ -30,6 +30,7 @@
 #include <libsolutil/cxx20.h>
 
 #include <range/v3/range/conversion.hpp>
+#include <range/v3/view/drop_last.hpp>
 #include <range/v3/view/enumerate.hpp>
 #include <range/v3/view/iota.hpp>
 #include <range/v3/view/reverse.hpp>
@@ -118,6 +119,7 @@ void SSAControlFlowGraphBuilder::operator()(FunctionDefinition const& _functionD
 	builder.sealBlock(functionInfo.entry);
 	builder(_functionDefinition.body);
 	functionInfo.exits.insert(builder.m_currentBlock);
+	// Artificial explicit function exit (`leave`) at the end of the body.
 	builder(Leave{debugDataOf(_functionDefinition)});
 }
 
@@ -141,28 +143,88 @@ void SSAControlFlowGraphBuilder::operator()(If const& _if)
 void SSAControlFlowGraphBuilder::operator()(Switch const& _switch)
 {
 	auto expression = std::visit(*this, *_switch.expression);
-	std::map<u256, SSACFG::BlockId> cases;
-	std::optional<SSACFG::BlockId> defaultCase;
-	std::vector<std::tuple<SSACFG::BlockId, std::reference_wrapper<Block const>>> children;
-	for (auto const& _case: _switch.cases)
-	{
-		auto blockId = m_graph.makeBlock(debugDataOf(_case.body));
-		if (_case.value)
-			cases[_case.value->value.value()] = blockId;
-		children.emplace_back(std::make_tuple(blockId, std::ref(_case.body)));
-	}
-	auto afterSwitch = m_graph.makeBlock(debugDataOf(currentBlock()));
 
-	tableJump(debugDataOf(_switch), expression, cases, defaultCase ? *defaultCase : afterSwitch);
-	for (auto [blockId, block]: children)
+	auto useJumpTableForSwitch = [](Switch const&) {
+		// TODO: check for EOF support & tight switch values.
+		return false;
+	};
+	if (useJumpTableForSwitch(_switch))
 	{
-		sealBlock(blockId);
-		m_currentBlock = blockId;
-		(*this)(block);
-		jump(debugDataOf(currentBlock()), afterSwitch);
+		// TODO: also generate a subtraction to shift tight, but non-zero switch cases - or, alternative,
+		// transform to zero-based tight switches on Yul if possible.
+		std::map<u256, SSACFG::BlockId> cases;
+		std::optional<SSACFG::BlockId> defaultCase;
+		std::vector<std::tuple<SSACFG::BlockId, std::reference_wrapper<Block const>>> children;
+		for (auto const& _case: _switch.cases)
+		{
+			auto blockId = m_graph.makeBlock(debugDataOf(_case.body));
+			if (_case.value)
+				cases[_case.value->value.value()] = blockId;
+			children.emplace_back(std::make_tuple(blockId, std::ref(_case.body)));
+		}
+		auto afterSwitch = m_graph.makeBlock(debugDataOf(currentBlock()));
+
+		tableJump(debugDataOf(_switch), expression, cases, defaultCase ? *defaultCase : afterSwitch);
+		for (auto [blockId, block]: children)
+		{
+			sealBlock(blockId);
+			m_currentBlock = blockId;
+			(*this)(block);
+			jump(debugDataOf(currentBlock()), afterSwitch);
+		}
+		sealBlock(afterSwitch);
+		m_currentBlock = afterSwitch;
 	}
-	sealBlock(afterSwitch);
-	m_currentBlock = afterSwitch;
+	else
+	{
+		auto makeValueCompare = [&](Case const& _case) {
+			yul::FunctionCall const& ghostCall = m_graph.ghostCalls.emplace_back(yul::FunctionCall{
+				debugDataOf(_case),
+				yul::Identifier{{}, "eq"_yulstring},
+				{*_case.value /* skip second argument */ }
+			});
+			auto outputValue = m_graph.newVariable(m_currentBlock);
+			BuiltinFunction const* builtin = m_dialect.builtin(ghostCall.functionName.name);
+			currentBlock().operations.emplace_back(SSACFG::Operation{
+				{outputValue},
+				SSACFG::BuiltinCall{
+					debugDataOf(_case),
+					*builtin,
+					ghostCall
+				},
+				{m_graph.newLiteral(_case.value->value.value()), expression}
+			});
+			return outputValue;
+		};
+
+		auto afterSwitch = m_graph.makeBlock(debugDataOf(currentBlock()));
+		yulAssert(!_switch.cases.empty(), "");
+		for (auto const& switchCase: _switch.cases | ranges::views::drop_last(1))
+		{
+			yulAssert(switchCase.value, "");
+			auto caseBranch = m_graph.makeBlock(debugDataOf(switchCase.body));
+			auto elseBranch = m_graph.makeBlock(debugDataOf(_switch));
+
+			conditionalJump(debugDataOf(switchCase), makeValueCompare(switchCase), caseBranch, elseBranch);
+			sealBlock(caseBranch);
+			sealBlock(elseBranch);
+			m_currentBlock = caseBranch;
+			(*this)(switchCase.body);
+			jump(debugDataOf(switchCase.body), afterSwitch);
+			m_currentBlock = elseBranch;
+		}
+		Case const& switchCase = _switch.cases.back();
+		if (switchCase.value)
+		{
+			auto caseBranch = m_graph.makeBlock(debugDataOf(switchCase.body));
+			conditionalJump(debugDataOf(switchCase), makeValueCompare(switchCase), caseBranch, afterSwitch);
+			sealBlock(caseBranch);
+			m_currentBlock = caseBranch;
+		}
+		(*this)(switchCase.body);
+		jump(debugDataOf(switchCase.body), afterSwitch);
+		sealBlock(afterSwitch);
+	}
 }
 void SSAControlFlowGraphBuilder::operator()(ForLoop const& _loop)
 {
@@ -325,6 +387,7 @@ void SSAControlFlowGraphBuilder::registerFunction(FunctionDefinition const& _fun
 	}) | ranges::to<std::vector>;
 	auto [it, inserted] = m_graph.functionInfos.emplace(std::make_pair(&function, SSACFG::FunctionInfo{
 		_functionDefinition.debugData,
+		function,
 		entryBlock,
 		{},
 		m_functionSideEffects.at(&_functionDefinition).canContinue,
@@ -352,8 +415,8 @@ std::vector<SSACFG::ValueId> SSAControlFlowGraphBuilder::visitFunctionCall(Funct
 		else
 		{
 			Scope::Function const& function = lookupFunction(_call.functionName.name);
-			SSACFG::Operation result{{}, SSACFG::Call{debugDataOf(_call), function, _call}, {}};
 			canContinue = m_graph.functionInfos.at(&function).canContinue;
+			SSACFG::Operation result{{}, SSACFG::Call{debugDataOf(_call), function, _call, canContinue}, {}};
 			for (auto const& arg: _call.arguments | ranges::views::reverse)
 				result.inputs.emplace_back(std::visit(*this, arg));
 			for(size_t i = 0; i < function.returns.size(); ++i)
