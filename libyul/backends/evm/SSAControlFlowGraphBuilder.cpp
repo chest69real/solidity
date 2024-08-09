@@ -220,6 +220,8 @@ void SSAControlFlowGraphBuilder::operator()(Switch const& _switch)
 			auto blockId = m_graph.makeBlock(debugDataOf(_case.body));
 			if (_case.value)
 				cases[_case.value->value.value()] = blockId;
+			else
+				defaultCase = blockId;
 			children.emplace_back(std::make_tuple(blockId, std::ref(_case.body)));
 		}
 		auto afterSwitch = m_graph.makeBlock(debugDataOf(currentBlock()));
